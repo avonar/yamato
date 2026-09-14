@@ -14,6 +14,7 @@ work=$(mktemp -d /tmp/tunnel-lab-netns.XXXXXX)
 prefix="tlab-$$"
 client="$prefix-c"; server="$prefix-s"; wan="$prefix-w"
 cleanup() {
+  trap '' INT TERM
   set +e
   for ns in "$client" "$server" "$wan"; do
     for pid in $(ip netns pids "$ns" 2>/dev/null); do kill -TERM "$pid" 2>/dev/null; done
@@ -25,7 +26,9 @@ cleanup() {
   done
   echo "Logs/configs: $work"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 for ns in "$client" "$server" "$wan"; do ip netns add "$ns"; ip -n "$ns" link set lo up; done
 # Create links inside their namespaces, without temporary host interfaces.
 ip -n "$client" link add underlay type veth peer name clientside netns "$server"

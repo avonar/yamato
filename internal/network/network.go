@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"tunnel-lab/internal/config"
@@ -20,18 +21,35 @@ type command []string
 type Manager struct {
 	undo []command
 	run  func(command) (string, error)
+	ctx  context.Context
 }
+
+// CleanupError prevents reconnecting over a network setup that was not restored.
+type CleanupError struct{ Err error }
+
+func (e *CleanupError) Error() string { return "network cleanup incomplete: " + e.Err.Error() }
+func (e *CleanupError) Unwrap() error { return e.Err }
+func CleanupFailed(err error) bool    { var cleanup *CleanupError; return errors.As(err, &cleanup) }
 
 func execute(c command) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	out, e := exec.CommandContext(ctx, c[0], c[1:]...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, c[0], c[1:]...)
+	// Terminal SIGINT must not interrupt an in-flight mutation or its rollback.
+	// Finish the bounded command, record its undo, then observe cancellation.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	out, e := cmd.CombinedOutput()
 	if e != nil {
 		return "", fmt.Errorf("%s: %w: %s", strings.Join(c, " "), e, strings.TrimSpace(string(out)))
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 func (m *Manager) add(do, undo command) error {
+	if m.ctx != nil {
+		if err := m.ctx.Err(); err != nil {
+			return err
+		}
+	}
 	log.Printf("network: %s", strings.Join(do, " "))
 	if _, e := m.run(do); e != nil {
 		return e
@@ -39,11 +57,16 @@ func (m *Manager) add(do, undo command) error {
 	if len(undo) > 0 {
 		m.undo = append(m.undo, undo)
 	}
+	if m.ctx != nil {
+		return m.ctx.Err()
+	}
 	return nil
 }
 func (m *Manager) Close() error {
 	var result error
+	failed := make([]command, 0)
 	for i := len(m.undo) - 1; i >= 0; i-- {
+		log.Printf("network restore: %s", strings.Join(m.undo[i], " "))
 		if _, e := m.run(m.undo[i]); e != nil {
 			// Destroying utun also removes routes bound to it on macOS.
 			if len(m.undo[i]) > 2 && m.undo[i][0] == "route" && m.undo[i][2] == "delete" && strings.Contains(e.Error(), "not in table") {
@@ -51,13 +74,24 @@ func (m *Manager) Close() error {
 			}
 			log.Printf("network restore failed: %v", e)
 			result = errors.Join(result, e)
+			failed = append(failed, m.undo[i])
 		}
 	}
-	m.undo = nil
-	return result
+	// Retain failed operations in their original order so Close can retry them.
+	for i, j := 0, len(failed)-1; i < j; i, j = i+1, j-1 {
+		failed[i], failed[j] = failed[j], failed[i]
+	}
+	m.undo = failed
+	if result != nil {
+		return &CleanupError{Err: result}
+	}
+	return nil
 }
 func Setup(ctx context.Context, c config.Config, iface string, remoteIPs []string) (*Manager, error) {
-	m := &Manager{run: execute}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m := &Manager{run: execute, ctx: ctx}
 	if !c.Network.Auto {
 		return m, nil
 	}
@@ -70,8 +104,7 @@ func Setup(ctx context.Context, c config.Config, iface string, remoteIPs []strin
 		e = errors.New("automatic network setup supports macOS client and Linux")
 	}
 	if e != nil {
-		m.Close()
-		return nil, e
+		return nil, errors.Join(e, m.Close())
 	}
 	return m, nil
 }

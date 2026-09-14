@@ -3,6 +3,7 @@ package tun
 import (
 	"errors"
 	"io"
+	"log"
 	"runtime"
 	"sync"
 
@@ -11,12 +12,13 @@ import (
 )
 
 type Device struct {
-	dev     wgtun.Device
-	Name    string
-	once    sync.Once
-	bufs    [][]byte
-	sizes   []int
-	pending [][]byte
+	dev      wgtun.Device
+	Name     string
+	once     sync.Once
+	closeErr error
+	bufs     [][]byte
+	sizes    []int
+	pending  [][]byte
 }
 
 func Open(name string) (*Device, error) {
@@ -77,4 +79,14 @@ func (d *Device) WritePacket(b []byte) error {
 	}
 	return e
 }
-func (d *Device) Close() error { var e error; d.once.Do(func() { e = d.dev.Close() }); return e }
+func (d *Device) Close() error {
+	d.once.Do(func() {
+		d.closeErr = d.dev.Close()
+		if d.closeErr == nil {
+			log.Printf("TUN closed: %s", d.Name)
+		} else {
+			log.Printf("TUN close failed: %s: %v", d.Name, d.closeErr)
+		}
+	})
+	return d.closeErr
+}

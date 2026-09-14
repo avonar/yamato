@@ -62,3 +62,60 @@ func TestMacPreservesDNSAndUnderlay(t *testing.T) {
 		t.Fatalf("underlay pin=%v DNS restore=%v", foundPin, foundRestore)
 	}
 }
+
+func TestCancelDuringMutationStillRollsBack(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls []command
+	m := &Manager{ctx: ctx, run: func(c command) (string, error) {
+		calls = append(calls, c)
+		if c[0] == "add-rule" {
+			cancel()
+		}
+		return "", nil
+	}}
+	if err := m.add(command{"add-rule"}, command{"delete-rule"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("mutation cancellation: %v", err)
+	}
+	if err := m.add(command{"add-next-rule"}, command{"delete-next-rule"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("new mutation after cancellation: %v", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(calls, []command{{"add-rule"}, {"delete-rule"}}) {
+		t.Fatalf("cancellation leaked or added rules: %v", calls)
+	}
+}
+
+func TestCleanupFailureIsReportedAndRetryable(t *testing.T) {
+	blocked := true
+	var calls []command
+	m := &Manager{undo: []command{{"restore-dns"}, {"delete-route"}}, run: func(c command) (string, error) {
+		calls = append(calls, c)
+		if c[0] == "delete-route" && blocked {
+			return "", errors.New("route table busy")
+		}
+		return "", nil
+	}}
+	if err := m.Close(); !CleanupFailed(err) {
+		t.Fatalf("cleanup failure hidden: %v", err)
+	}
+	blocked = false
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m.Close()
+	want := []command{{"delete-route"}, {"restore-dns"}, {"delete-route"}}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("retry repeated successful operations or lost failed operation: %v", calls)
+	}
+}
+
+func TestSetupAlreadyCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if m, err := Setup(ctx, config.Config{}, "unused", nil); m != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("setup ignored cancellation: %v", err)
+	}
+}

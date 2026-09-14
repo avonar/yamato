@@ -28,7 +28,7 @@ func main() {
 		os.Exit(1)
 	}
 }
-func run() error {
+func run() (result error) {
 	if len(os.Args) > 1 && os.Args[1] == "init" {
 		return generate(os.Args[2:])
 	}
@@ -55,15 +55,37 @@ func run() error {
 		return errors.New("count must be positive; size must be 1..1280")
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	logged := make(chan struct{})
+	stopLog := context.AfterFunc(ctx, func() { log.Print("shutdown requested: closing connections and restoring network"); close(logged) })
+	defer func() {
+		if !stopLog() {
+			<-logged
+		}
+		if ctx.Err() != nil {
+			if result == nil {
+				log.Print("shutdown complete")
+			} else {
+				log.Printf("shutdown failed: %v", result)
+			}
+		}
+		cancel()
+	}()
 	log.Printf("role=%s transport=%s mode=%s", c.Role, c.Transport, *mode)
 	if c.Role == "server" {
-		return transport.Serve(ctx, c, func(ctx context.Context, p transport.PacketConn) error {
+		var cleanupErr error
+		err := transport.Serve(ctx, c, func(ctx context.Context, p transport.PacketConn) error {
 			if *mode == "echo" {
 				return echo(p)
 			}
-			return runTUN(ctx, c, p)
+			err := runTUN(ctx, c, p)
+			if network.CleanupFailed(err) {
+				cleanupErr = err
+				cancel()
+			}
+			return err
 		})
+		// Serve joins all session handlers before returning.
+		return errors.Join(err, cleanupErr)
 	}
 	for {
 		p, e := transport.Dial(ctx, c)
@@ -71,10 +93,16 @@ func run() error {
 			if *mode == "probe" {
 				e = probe(ctx, p, *count, *size)
 				p.Close()
+				if ctx.Err() != nil {
+					return nil
+				}
 				return e
 			}
 			e = runTUN(ctx, c, p)
 			p.Close()
+		}
+		if network.CleanupFailed(e) {
+			return e
 		}
 		if ctx.Err() != nil {
 			return nil
@@ -101,13 +129,20 @@ func echo(p transport.PacketConn) error {
 		}
 	}
 }
-func runTUN(ctx context.Context, c config.Config, p transport.PacketConn) error {
+func runTUN(ctx context.Context, c config.Config, p transport.PacketConn) (result error) {
 	defer p.Close()
+	if e := ctx.Err(); e != nil {
+		return e
+	}
 	d, e := tun.Open(c.TUN)
 	if e != nil {
 		return fmt.Errorf("create TUN (root required): %w", e)
 	}
-	defer d.Close()
+	defer func() {
+		if err := d.Close(); err != nil {
+			result = errors.Join(result, &network.CleanupError{Err: fmt.Errorf("close TUN %s: %w", d.Name, err)})
+		}
+	}()
 	var remoteIPs []string
 	if rp, ok := p.(interface{ UnderlayIPs() []string }); ok {
 		remoteIPs = rp.UnderlayIPs()
@@ -116,7 +151,14 @@ func runTUN(ctx context.Context, c config.Config, p transport.PacketConn) error 
 	if e != nil {
 		return e
 	}
-	defer manager.Close()
+	defer func() {
+		log.Printf("session cleanup: restoring network for %s", d.Name)
+		if err := manager.Close(); err != nil {
+			result = errors.Join(result, err)
+			return
+		}
+		log.Printf("session cleanup: network restored for %s", d.Name)
+	}()
 	log.Printf("TUN ready: %s MTU=%d IPv4=%s IPv6=%s auto=%t", d.Name, transport.MTU, c.Network.IPv4, c.Network.IPv6, c.Network.Auto)
 	var allowed []netip.Addr
 	if c.Role == "server" {
