@@ -32,9 +32,16 @@ func TestRollback(t *testing.T) {
 
 func TestMacPreservesDNSAndUnderlay(t *testing.T) {
 	var calls []command
+	pinned := false
 	m := &Manager{run: func(c command) (string, error) {
 		calls = append(calls, c)
+		if reflect.DeepEqual(c, command{"route", "-n", "add", "-inet", "-host", "192.0.2.10", "192.168.1.1"}) {
+			pinned = true
+		}
 		if reflect.DeepEqual(c, command{"route", "-n", "get", "192.0.2.10"}) {
+			if pinned {
+				return "gateway: 192.168.1.1\ninterface: en0\nflags: <UP,GATEWAY,HOST,STATIC>", nil
+			}
 			return "gateway: 192.168.1.1\ninterface: en0\nflags: <UP,GATEWAY,STATIC>", nil
 		}
 		if c[0] == "networksetup" && c[1] == "-getdnsservers" {

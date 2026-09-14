@@ -333,6 +333,6 @@ func (s *sipConn) WritePacket(b []byte) error {
 		return io.EOF
 	case <-t.C:
 		s.Close()
-		return errors.New("SIP transaction timeout")
+		return fmt.Errorf("SIP transaction timeout: waiting for 200 OK, CSeq=%s, peer=%s", seq, s.RemoteAddr())
 	}
 }

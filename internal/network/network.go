@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -159,37 +160,22 @@ func (m *Manager) mac(ctx context.Context, c config.Config, iface string, remote
 			ips[a.IP.String()] = true
 		}
 	}
+	orderedIPs := make([]string, 0, len(ips))
 	for ip := range ips {
+		orderedIPs = append(orderedIPs, ip)
+	}
+	sort.Strings(orderedIPs)
+	var originalRoutes []macRoute
+	for _, ip := range orderedIPs {
 		parsed := net.ParseIP(ip)
 		if parsed.IsLoopback() {
 			continue
 		}
-		args := command{"route", "-n", "get", ip}
-		out, e := m.run(args)
-		if e != nil {
-			return e
+		r, err := m.pinMacRoute(ip, iface)
+		if err != nil {
+			return err
 		}
-		gw, dev := field(out, "gateway"), field(out, "interface")
-		if dev == "" {
-			return fmt.Errorf("cannot determine original route to %s", ip)
-		}
-		family := "-inet"
-		if parsed.To4() == nil {
-			family = "-inet6"
-		}
-		// A pre-existing host route already survives the split default routes.
-		if strings.Contains(field(out, "flags"), "HOST") {
-			continue
-		}
-		add := command{"route", "-n", "add", family, "-host", ip}
-		if net.ParseIP(strings.Split(gw, "%")[0]) != nil {
-			add = append(add, gw)
-		} else {
-			add = append(add, "-interface", dev)
-		}
-		if e = m.add(add, command{"route", "-n", "delete", family, "-host", ip}); e != nil {
-			return e
-		}
+		originalRoutes = append(originalRoutes, r)
 	}
 	if n.DNSService != "" && len(n.DNS) > 0 {
 		old, e := m.run(command{"networksetup", "-getdnsservers", n.DNSService})
@@ -221,7 +207,7 @@ func (m *Manager) mac(ctx context.Context, c config.Config, iface string, remote
 			}
 		}
 	}
-	return nil
+	return m.verifyMacRoutes(originalRoutes, iface)
 }
 func (m *Manager) linux(c config.Config, iface string) error {
 	n := c.Network
